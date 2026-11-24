@@ -27,6 +27,20 @@ DSH（DeepSeek Harness）Web 插件：在输入框下方显示**当前对话已�
 - 每条请求按它自己的时间戳判定峰谷，所以跨过 12:00 的一轮对话会自动分段计价。
 - 价格来源：<https://api-docs.deepseek.com/zh-cn/quick_start/pricing/>，价目版本记录在接口返回的 `pricingVersion`。
 
+### usage 字段怎么解读（最容易算错的地方）
+
+不同 provider 对「缓存命中」的表达**不一样**，同一组字段名的含义可能相反：
+
+| 形态 | 例子 | 含义 |
+| --- | --- | --- |
+| **互斥两个桶** | DeepSeek：`inputTokens`=205、`cacheReadTokens`=342656、`totalTokens`=342959 | `inputTokens` **只是未命中部分**，命中部分在 `cacheReadTokens` 里；`totalTokens` = 三者之和 |
+| **包含关系** | OpenAI 风格：`inputTokens`=1000、`cacheReadTokens`=800、`totalTokens`=1100 | `inputTokens` 是**整个 prompt**，命中部分是它的子集 |
+
+插件用 `totalTokens` 自动判定形态：等于 `input+output+cacheRead` 就按互斥桶拆，等于 `input+output` 就按子集拆；没有 `totalTokens` 时用「命中数是否大于输入数」兜底。
+
+这一条是本插件曾经出错的地方：把 DeepSeek 的互斥桶当成包含关系，会让每轮 30 多万缓存 token 被直接丢掉，总价少算约 3 倍。现在有回归测试用真实字段组合钉住两种形态。
+
+
 ### 模型怎么自动匹配
 
 每条请求记录里都带着实际调用时的模型 id，插件按下面的顺序自动认价：
@@ -72,6 +86,31 @@ DSH（DeepSeek Harness）Web 插件：在输入框下方显示**当前对话已�
 
 `GET /api/dsh-conversation-cost/pricing` 返回内置价目表、生效中的配置覆盖项，以及当前运行时识别到的模型列表，用来确认某个模型是精确计价还是估算。
 
+## 自己核对：`scripts/verify-log.mjs`
+
+插件算得对不对，不用信它自己。这个脚本**不引用插件代码**，直接解压磁盘上的 `session.v4.jsonl.zstd`（多帧 zstd，逐帧解码），重新提取每条 `usage` 并按官方价目表重算：
+
+```sh
+node scripts/verify-log.mjs                                  # 最新的会话日志
+node scripts/verify-log.mjs <会话目录或 .zstd 文件>            # 指定会话
+node scripts/verify-log.mjs <文件> --json                     # 机器可读
+```
+
+它输出请求数、`peak/off-peak` 分布、命中/未命中/输出 tokens、命中率、总价，以及按轮、按模型的明细。在本机上对同一会话比对，插件与它逐项一致（262 次请求，¥4.630554，差额 ¥0.000000）。
+
+> 注意：不带参数时它取「最近修改」的日志。如果你同时开着多个对话，而最近那个是不含本次内容的会话，比对会看起来对不上，这时请显式传路径。`--json` 里的 `file` 字段就是它实际读的文件。
+
+## 已知偏差（会与账单不一致的地方）
+
+即使计价正确，下面这些仍会让「插件显示」与「平台账单」有差距：
+
+1. **只算这条会话** —— 子代理（subagent）跑在**独立会话**里，费用不计入父会话；同一工作区的其他对话同理。要算总账得把各自的会话加总。
+2. **会话标题生成** —— 首轮自动起标题是一次独立的模型调用，不写进会话日志，因此未被计入。
+3. **失败/中断的请求** —— provider 可能已经为流到一半的请求计费，但日志里没有带 `usage` 的 `assistant/message`，插件无从得知。
+4. **中国法定节假日** —— 只按「工作日 9:00-12:00 / 14:00-18:00」判峰谷，节假日会被当成工作日，那几天的高峰时段金额会略偏高。
+5. **时点归属** —— 按请求**结束**时间判峰谷；跨 18:00 结束的请求按空闲价算，而平台可能按高峰计费。
+6. **非 DeepSeek 模型** —— 没配置单价时按 Flash 单价估算（界面有 `≈`），不是真实账单。
+
 ## 只统计「活会话」
 
 费用接口走 Host 的活会话内存（`ctx.sessions.get`），所以：
@@ -79,15 +118,18 @@ DSH（DeepSeek Harness）Web 插件：在输入框下方显示**当前对话已�
 - 打开的会话、正在运行的会话：正常显示金额；
 - 还没打开的旧会话：显示 `¥—`，打开后立即恢复。
 
-这样不需要解压 / 解析磁盘上的会话文件，也不会有多帧压缩日志的兼容问题。
+这样不需要解压 / 解析磁盘上的会话文件，也不会有多帧压缩日志的兼容问题（磁盘解析只发生在上面那个核对脚本里）。
 
 ## 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/dsh-conversation-cost/session?sessionId=<id>` | 该会话累计的人民币费用、按模型明细与按轮次明细 |
+| GET | `/api/dsh-conversation-cost/pricing` | 内置价目表、生效中的配置覆盖、运行时识别到的模型清单 |
 
 返回里的 `turns` 是每一轮的 `{ turn, startSeq, endSeq, requests, cost, … }`：`startSeq`/`endSeq` 是该轮 `turn/start` → `turn/end` 的事件序号，聊天界面用它把「本轮费用」放到对应的那一轮末尾。没有上报用量的轮次不出现在 `turns` 里，各行 `cost` 之和恒等于 `totalCost`。
+
+返回里的 `inputTokens` 是**完整 prompt**（命中 + 未命中）便于阅读；精确拆分看 `cacheHitTokens` / `cacheMissTokens`，计价只用后两者。
 
 仅接受本机回环地址的同源请求；未知会话返回 `404 { ok: false, reason: 'not-live' }`，缺参数返回 400。
 
@@ -100,7 +142,8 @@ cordis.patch.yml    bundle 挂载声明
 locale/zh.json      插件管理器里显示的中文标题与描述
 locale/en.json      English title and description
 icon.svg            插件图标
-scripts/check.mjs   离线校验：Host 路由折叠 / 峰谷计价 / Client 装配
+scripts/check.mjs   离线校验：Host 路由折叠 / 峰谷计价 / token 桶形态 / Client 装配
+scripts/verify-log.mjs 独立核对：直接读磁盘日志重算费用
 ```
 
 ## 安装
@@ -127,6 +170,8 @@ node scripts/check.mjs
 - 空闲时段：100 万输入（60 万缓存命中）+ 100 万输出 = **¥4.412**；
 - 高峰时段同一份用量 = **¥8.824**；
 - 两轮对话按 `turn/start`/`turn/end` 分段计价，序号区间与金额正确，且各轮之和等于总额；
+- **token 桶形态**：DeepSeek 的互斥桶（`total = input+output+cacheRead`）按 `miss=input` 计，缓存 token 一个不丢；OpenAI 的包含关系按 `miss=input-hit` 计；缺 `totalTokens` 时两种兜底；
+- 模型自动匹配的 7 种情形（精确 / 别名 / 已下线 / 目录命中 / 未知 / 覆盖 / 覆盖已知行）；
 - 重复读取不重复计数；未知模型回退 Flash 单价并打标记；
 - 缺失会话 404、缺参数 400；
 - Client 侧三个插槽（`conversation.composer.dock` / `conversation.input.dock` / `conversation.chat.turnTail`）都已注册；

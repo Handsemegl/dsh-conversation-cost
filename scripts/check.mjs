@@ -328,6 +328,68 @@ pricingHost.disposeAll()
 
 matching.disposeAll()
 
+/* --------------------- provider usage bucket semantics ------------------- */
+
+// Real DeepSeek reports split cached and uncached prompt tokens into disjoint
+// buckets: total = input + output + cacheRead, where `input` is ONLY the
+// uncached prompt. Pricing the cached tokens at the miss rate (or dropping
+// them) is the single biggest error this plugin can make, so pin it.
+const BUCKET_SESSIONS = new Map()
+const bucketHost = mountHost((id) => BUCKET_SESSIONS.get(id))
+await new Promise((resolve) => setTimeout(resolve, 10))
+
+async function priceUsage(id, usage) {
+  BUCKET_SESSIONS.set(
+    id,
+    fakeSession([
+      { seq: 0, type: 'turn/start', time: OFF_PEAK, data: { turn: 1 } },
+      {
+        seq: 1,
+        type: 'assistant/message',
+        time: OFF_PEAK,
+        data: {
+          turn: 1,
+          message: { source: { kind: 'model', provider: 'deepseek', model: 'deepseek-flash' } },
+          usage,
+        },
+      },
+    ]),
+  )
+  const body = JSON.parse((await call(SESSION_ROUTE(), '/api/dsh-conversation-cost/session?sessionId=' + id)).body)
+  return body
+}
+
+// The exact shape of one real request from this session's log.
+const realShape = await priceUsage('b1', { inputTokens: 205, outputTokens: 98, cacheReadTokens: 342656, totalTokens: 342959 })
+assert.equal(realShape.cacheHitTokens, 342656, 'cached tokens must not be dropped')
+assert.equal(realShape.cacheMissTokens, 205, 'input is the uncached prompt, not the whole prompt')
+assert.equal(realShape.inputTokens, 342861, 'displayed input must be hit + miss')
+// off-peak: 342656*0.02 + 205*1 + 98*4 = 6853.12 + 205 + 392 = 7450.12 per 1M
+assert.ok(
+  Math.abs(realShape.totalCost - 0.00745012) < 1e-9,
+  `disjoint-bucket cost ${realShape.totalCost} != 0.00745012`,
+)
+
+// An OpenAI-shaped report keeps the cached tokens inside inputTokens.
+const subsetShape = await priceUsage('b2', { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 800, totalTokens: 1100 })
+assert.equal(subsetShape.cacheHitTokens, 800)
+assert.equal(subsetShape.cacheMissTokens, 200, 'cached tokens are a subset of input here')
+assert.equal(subsetShape.inputTokens, 1000, 'displayed input stays the reported prompt')
+// off-peak: 800*0.02 + 200*1 + 100*4 = 16 + 200 + 400 = 616 per 1M
+assert.ok(Math.abs(subsetShape.totalCost - 0.000616) < 1e-9, `subset-bucket cost ${subsetShape.totalCost} != 0.000616`)
+
+// A report with no totalTokens but cacheRead > input can only be disjoint.
+const noTotal = await priceUsage('b3', { inputTokens: 100, outputTokens: 0, cacheReadTokens: 5000 })
+assert.equal(noTotal.cacheHitTokens, 5000)
+assert.equal(noTotal.cacheMissTokens, 100)
+
+// A report with no totalTokens and cacheRead <= input stays conservative.
+const ambiguous = await priceUsage('b4', { inputTokens: 1000, outputTokens: 0, cacheReadTokens: 300 })
+assert.equal(ambiguous.cacheHitTokens, 300)
+assert.equal(ambiguous.cacheMissTokens, 700)
+
+bucketHost.disposeAll()
+
 /* --------------------------------- client -------------------------------- */
 
 const registered = []
