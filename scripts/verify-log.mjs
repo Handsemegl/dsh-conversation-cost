@@ -11,6 +11,7 @@
  * Usage:
  *   node scripts/verify-log.mjs                 # newest log under ~/.dsh/sessions
  *   node scripts/verify-log.mjs <file-or-dir>   # one session file or directory
+ *   node scripts/verify-log.mjs --with-children # also merge subagent descendants
  *   node scripts/verify-log.mjs --json          # machine-readable output
  */
 
@@ -134,6 +135,7 @@ function rateOf(model) {
 
 const args = process.argv.slice(2)
 const asJson = args.includes('--json')
+const withChildren = args.includes('--with-children')
 const input = args.find((arg) => !arg.startsWith('--'))
 const file = resolveLog(input)
 const { events, frames, skipped } = readEvents(file)
@@ -144,45 +146,122 @@ const byTurn = new Map()
 const byModel = new Map()
 const totals = { requests: 0, hit: 0, miss: 0, output: 0, cost: 0, peak: 0, offPeak: 0 }
 
-for (const event of events) {
-  if (event.type !== 'assistant/message') continue
-  const usage = event.data?.usage
-  if (usage === null || usage === undefined) continue
-  const { hit, miss } = split(usage)
-  const output = Number(usage.outputTokens ?? 0)
-  const model = event.data?.message?.source?.model ?? 'unknown'
-  const row = rateOf(model)
-  const peak = isPeak(event.time)
-  const band = peak ? 1 : 0.5
-  const cost = (hit * row.hit + miss * row.miss + output * row.out) / 1e6 * band
+/** Accumulate one session's events into the report tables. */
+function addEvents(sessionEvents, trackTurns = true) {
+  for (const event of sessionEvents) {
+    if (event.type !== 'assistant/message') continue
+    const usage = event.data?.usage
+    if (usage === null || usage === undefined) continue
+    const { hit, miss } = split(usage)
+    const output = Number(usage.outputTokens ?? 0)
+    const model = event.data?.message?.source?.model ?? 'unknown'
+    const row = rateOf(model)
+    const peak = isPeak(event.time)
+    const band = peak ? 1 : 0.5
+    const cost = (hit * row.hit + miss * row.miss + output * row.out) / 1e6 * band
 
-  totals.requests += 1
-  totals.hit += hit
-  totals.miss += miss
-  totals.output += output
-  totals.cost += cost
-  if (peak) totals.peak += 1
-  else totals.offPeak += 1
+    totals.requests += 1
+    totals.hit += hit
+    totals.miss += miss
+    totals.output += output
+    totals.cost += cost
+    if (peak) totals.peak += 1
+    else totals.offPeak += 1
 
-  const turn = event.data?.turn ?? -1
-  const t = byTurn.get(turn) ?? { turn, requests: 0, hit: 0, miss: 0, output: 0, cost: 0 }
-  t.requests += 1
-  t.hit += hit
-  t.miss += miss
-  t.output += output
-  t.cost += cost
-  byTurn.set(turn, t)
+    if (trackTurns) {
+      const turn = event.data?.turn ?? -1
+      const t = byTurn.get(turn) ?? { turn, requests: 0, hit: 0, miss: 0, output: 0, cost: 0 }
+      t.requests += 1
+      t.hit += hit
+      t.miss += miss
+      t.output += output
+      t.cost += cost
+      byTurn.set(turn, t)
+    }
 
-  const m = byModel.get(model) ?? { model, requests: 0, hit: 0, miss: 0, output: 0, cost: 0 }
-  m.requests += 1
-  m.hit += hit
-  m.miss += miss
-  m.output += output
-  m.cost += cost
-  byModel.set(model, m)
+    const m = byModel.get(model) ?? { model, requests: 0, hit: 0, miss: 0, output: 0, cost: 0 }
+    m.requests += 1
+    m.hit += hit
+    m.miss += miss
+    m.output += output
+    m.cost += cost
+    byModel.set(model, m)
+  }
 }
 
+addEvents(events)
+
+/**
+ * Find subagent descendants by header lineage across every session log.
+ * A user fork also records `parentSession` but has no `origin: 'subagent'`,
+ * so it is not merged.
+ * @param rootId - the session whose subtree is collected
+ * @returns one entry per descendant, nearest first
+ */
+function findChildren(rootId) {
+  const index = new Map()
+  const walk = (dir) => {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        walk(path)
+        continue
+      }
+      if (!entry.name.endsWith('.jsonl.zstd')) continue
+      let sessionEvents
+      try {
+        sessionEvents = readEvents(path).events
+      } catch {
+        continue
+      }
+      const header = sessionEvents.find((event) => event.type === 'session')
+      if (header === undefined || typeof header.id !== 'string') continue
+      index.set(header.id, { id: header.id, path, header })
+    }
+  }
+  walk(join(homedir(), '.dsh', 'sessions'))
+
+  const found = []
+  const seen = new Set([rootId])
+  const queue = [rootId]
+  while (queue.length > 0) {
+    const parent = queue.shift()
+    for (const entry of index.values()) {
+      if (entry.header.parentSession !== parent) continue
+      if (entry.header.origin !== 'subagent') continue
+      if (seen.has(entry.id)) continue
+      seen.add(entry.id)
+      const before = { requests: totals.requests, cost: totals.cost }
+      addEvents(readEvents(entry.path).events, false)
+      found.push({
+        sessionId: entry.id,
+        requests: totals.requests - before.requests,
+        cost: totals.cost - before.cost,
+        depth: entry.header.delegationDepth ?? 0,
+      })
+      queue.push(entry.id)
+    }
+  }
+  return found
+}
+
+const sessionEvent = events.find((event) => event.type === 'session')
+const ownCost = totals.cost
+let children = []
+if (withChildren && typeof sessionEvent?.id === 'string') {
+  children = findChildren(sessionEvent.id)
+}
 const report = {
+  sessionId: sessionEvent === undefined ? undefined : sessionEvent.id,
+  ownCost,
+  childCost: totals.cost - ownCost,
+  children,
   file,
   frames,
   skippedFrames: skipped,
@@ -205,6 +284,15 @@ if (asJson) {
   console.log(`output          ${n(totals.output)}`)
   console.log(`total prompt    ${n(totals.hit + totals.miss)}  (hit rate ${((totals.hit / (totals.hit + totals.miss)) * 100).toFixed(1)}%)`)
   console.log(`cost            ¥${totals.cost.toFixed(6)}`)
+  if (withChildren) {
+    console.log(`  own           ¥${ownCost.toFixed(6)}`)
+    console.log(`  subagents     ¥${(totals.cost - ownCost).toFixed(6)}  (${children.length} session${children.length === 1 ? '' : 's'})`)
+    for (const child of children) {
+      console.log(`    ${child.sessionId}  depth ${child.depth}  ${child.requests} req  ¥${child.cost.toFixed(6)}`)
+    }
+  } else if (children.length === 0) {
+    console.log('  (run with --with-children to merge subagent sessions)')
+  }
   console.log('')
   console.log('per turn:')
   for (const t of report.turns) {

@@ -4,20 +4,62 @@
  * 1. Host: mount apply() against fakes and drive the HTTP route handler with a
  *    synthetic session log, asserting the folded token totals and the CNY cost
  *    for both peak and off-peak timestamps.
- * 2. Client: evaluate the module-loader bundle with a stub React, run apply(),
+ * 2. Subagents: build a throwaway `DSH_HOME` with real multi-frame zstd logs and
+ *    assert that child and grandchild spend merges into the parent, while a user
+ *    fork does not.
+ * 3. Client: evaluate the module-loader bundle with a stub React, run apply(),
  *    and confirm both slot registrations and that the components render.
  *
  * Run with: node scripts/check.mjs
  */
 
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
+import { zstdCompressSync } from 'node:zlib'
 import vm from 'node:vm'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
+
+/* ----------------------- isolated on-disk session home -------------------- */
+
+// The Host half reads session headers from `$DSH_HOME/sessions` to discover
+// subagent children, so point it at a throwaway home BEFORE any route is called.
+const fakeHome = mkdtempSync(join(tmpdir(), 'dsh-cost-'))
+process.env.DSH_HOME = fakeHome
+
+/** One usage-bearing event, priced at OFF_PEAK unless told otherwise. */
+function usageEvent({ seq = 1, turn = 1, model = 'deepseek-flash', input = 1000000, output = 0, cacheRead = 0, time } = {}) {
+  return {
+    seq,
+    type: 'assistant/message',
+    time: time ?? Date.UTC(2026, 10, 21, 2, 0, 0),
+    data: {
+      turn,
+      message: { source: { kind: 'model', provider: 'deepseek', model } },
+      usage: { inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, totalTokens: input + output + cacheRead },
+    },
+  }
+}
+
+/** Write one real session log: header frame + events frame, like the Host does. */
+function writeSessionLog(sessionId, header, events) {
+  const dir = join(fakeHome, 'sessions', '--workspace--', sessionId)
+  mkdirSync(dir, { recursive: true })
+  const headerFrame = zstdCompressSync(Buffer.from(JSON.stringify({ type: 'session', version: 4, id: sessionId, createdAt: 1, isSeeded: false, ...header }) + '\n'))
+  const bodyFrame = zstdCompressSync(Buffer.from(events.map((event) => JSON.stringify(event)).join('\n') + '\n'))
+  writeFileSync(join(dir, 'session.v4.jsonl.zstd'), Buffer.concat([headerFrame, bodyFrame]))
+  return dir
+}
+
+// A subagent child, its own grandchild, and a user fork that must NOT merge.
+writeSessionLog('child-1', { parentSession: 'parent-1', origin: 'subagent', delegationDepth: 1 }, [usageEvent({ input: 1000000 })])
+writeSessionLog('child-2', { parentSession: 'child-1', origin: 'subagent', delegationDepth: 2 }, [usageEvent({ input: 500000 })])
+writeSessionLog('fork-1', { parentSession: 'parent-1' }, [usageEvent({ input: 2000000 })])
+writeSessionLog('unrelated', {}, [usageEvent({ input: 9000000 })])
 
 const host = await import(pathToFileURL(join(root, 'lib/index.js')).href)
 
@@ -35,7 +77,7 @@ function mountHost(getSession, options = {}) {
   const disposers = []
   const events = new Map()
   const ctx = {
-    sessions: { get: getSession },
+    sessions: { get: getSession, list: () => options.live ?? [] },
     webServer: {
       register(candidate) {
         routes.set(candidate.path, candidate)
@@ -389,6 +431,66 @@ assert.equal(ambiguous.cacheHitTokens, 300)
 assert.equal(ambiguous.cacheMissTokens, 700)
 
 bucketHost.disposeAll()
+
+/* --------------------------- subagent merge ------------------------------- */
+
+// The parent is live (in memory); its children exist only as on-disk logs, which
+// is exactly the "subagent already finished" case the merge has to cover.
+const MERGE_SESSIONS = new Map()
+MERGE_SESSIONS.set('parent-1', fakeSession([usageEvent({ input: 1000000 })]))
+const mergeHost = mountHost((id) => MERGE_SESSIONS.get(id))
+await new Promise((resolve) => setTimeout(resolve, 10))
+
+const merged = JSON.parse((await call(SESSION_ROUTE(), '/api/dsh-conversation-cost/session?sessionId=parent-1')).body)
+assert.equal(merged.ok, true)
+assert.equal(merged.ownRequests, 1)
+assert.equal(merged.childRequests, 2, 'child and grandchild must both merge')
+assert.equal(merged.requests, 3)
+assert.deepEqual(
+  merged.children.map((child) => [child.sessionId, child.depth]),
+  [
+    ['child-1', 1],
+    ['child-2', 2],
+  ],
+  'descendants are listed breadth-first with their depth',
+)
+assert.ok(!merged.children.some((child) => child.sessionId === 'fork-1'), 'a user fork is not a subagent')
+assert.ok(!merged.children.some((child) => child.sessionId === 'unrelated'))
+
+// 1M own + 1M child + 0.5M grandchild, all off-peak cache miss at ¥1/M.
+assert.ok(Math.abs(merged.ownCost - 1) < 1e-9, `own cost ${merged.ownCost} != 1`)
+assert.ok(Math.abs(merged.childCost - 1.5) < 1e-9, `child cost ${merged.childCost} != 1.5`)
+assert.ok(Math.abs(merged.totalCost - 2.5) < 1e-9, `merged total ${merged.totalCost} != 2.5`)
+assert.ok(Math.abs(merged.ownCost + merged.childCost - merged.totalCost) < 1e-9, 'total = own + children')
+// Merged token totals stay consistent with the merged cost.
+assert.equal(merged.cacheMissTokens, 2500000)
+assert.equal(merged.inputTokens, 2500000)
+
+// Per-turn rows stay parent-only, so a child's turns never land on transcript rows.
+assert.equal(merged.turns.length, 1)
+assert.ok(Math.abs(merged.turns[0].cost - 1) < 1e-9, 'the turn row carries only the parent turn')
+
+// The merged models list must add up to the merged total.
+const modelSum = merged.models.reduce((sum, model) => sum + model.cost, 0)
+assert.ok(Math.abs(modelSum - merged.totalCost) < 1e-9, `models sum ${modelSum} != total ${merged.totalCost}`)
+
+// A live child (still running, log not flushed yet) must fold from memory.
+const liveChild = {
+  id: 'live-child-9',
+  header: { parentSession: 'parent-1', origin: 'subagent', delegationDepth: 1 },
+  snapshotEvents: (from) => [usageEvent({ input: 4000000 })].filter((event) => event.seq >= from),
+}
+MERGE_SESSIONS.set('live-child-9', liveChild)
+mergeHost.disposeAll()
+const liveMergeHost = mountHost((id) => MERGE_SESSIONS.get(id), { live: [liveChild] })
+await new Promise((resolve) => setTimeout(resolve, 10))
+const withLive = JSON.parse((await call(SESSION_ROUTE(), '/api/dsh-conversation-cost/session?sessionId=parent-1')).body)
+assert.equal(withLive.children.length, 3, 'a live child joins the on-disk ones')
+assert.equal(withLive.children.find((child) => child.sessionId === 'live-child-9')?.live, true)
+assert.ok(Math.abs(withLive.childCost - 5.5) < 1e-9, `child cost with live child ${withLive.childCost} != 5.5`)
+assert.ok(Math.abs(withLive.totalCost - 6.5) < 1e-9, `merged total with live child ${withLive.totalCost} != 6.5`)
+
+liveMergeHost.disposeAll()
 
 /* --------------------------------- client -------------------------------- */
 
