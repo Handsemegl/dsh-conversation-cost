@@ -1,0 +1,8 @@
+# dsh-conversation-cost：对话费用插件
+# 在 web profile 的装配清单中插入插件行：
+#   Host 半区（exports "."）注册 /api/dsh-conversation-cost/* 只读路由，
+#   从会话日志的 provider usage 聚合 token 用量并按 DeepSeek 官方人民币价目表折算费用；
+#   Client 半区（exports "./client"）在输入框下方显示 ¥ 金额，并可展开明细。
+- insert:
+    - id: conversation-cost
+      name: 'dsh-conversation-cost'

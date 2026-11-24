@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+lib/_debug.mjs
+scripts/_debug.mjs
+scripts/_probe*.mjs

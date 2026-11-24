@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Conversation cost",
+    "description": "Shows the RMB cost of the current conversation under the composer, with a per-model breakdown of cache hit and peak/off-peak usage."
+  }
+}
